@@ -28,11 +28,52 @@ _SEM = threading.BoundedSemaphore(_JOBS)
 _ENCODER = "aac"
 
 
-def _heavy(cmd):
-    """Run a CPU-heavy ffmpeg call, capping concurrent encodes to _JOBS so
-    parallel parts saturate the cores without oversubscribing them."""
-    with _SEM:
+def _hms(t):
+    """'HH:MM:SS.micro' -> seconds; None for 'N/A'/garbage."""
+    try:
+        h, m, s = t.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except ValueError:
+        return None
+
+
+_PROGRESS_KEYS = ("frame=", "fps=", "stream_", "bitrate=", "total_size=",
+                  "out_time", "dup_frames=", "drop_frames=", "speed=", "progress=")
+
+
+def _run_progress(cmd, total_s, label):
+    """Like run(), but streams ffmpeg's -progress and prints percent as it
+    encodes. total_s is the input duration; without it we can't compute a
+    percent so we fall back to a plain (silent) run."""
+    if not total_s:
         return run(cmd)
+    full = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    # stderr merged into stdout so a chatty encode can't fill an unread pipe
+    proc = subprocess.Popen(full, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    tail, last = [], -10
+    for line in proc.stdout:                        # progress lines + warnings
+        if line.startswith("out_time="):
+            secs = _hms(line.strip().split("=", 1)[1])
+            if secs is not None:
+                pct = min(99, int(secs / total_s * 100))
+                if pct >= last + 10:                # throttle: every ~10%
+                    last = pct
+                    print(f"   … {label}: {pct}%", flush=True)
+        elif not line.startswith(_PROGRESS_KEYS):
+            tail.append(line)
+            del tail[:-20]                          # keep only the last warnings
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd,
+                                            stderr="".join(tail))
+
+
+def _heavy(cmd, total_s=None, label=None):
+    """Run a CPU-heavy ffmpeg call, capping concurrent encodes to _JOBS so
+    parallel parts saturate the cores without oversubscribing them. With a
+    label, streams live percent (see _run_progress)."""
+    with _SEM:
+        return _run_progress(cmd, total_s, label) if label else run(cmd)
 
 
 def _has_encoder(name):
@@ -192,10 +233,13 @@ def _prep_part(src, work, idx):
     """Encode (or copy, if already AAC) one part to a uniform AAC temp on its
     own core. Returns (temp_path, duration_seconds)."""
     dst = work / f"part{idx:04d}.m4a"
-    codec = ["-c:a", "copy"] if src.suffix.lower() in AAC_EXTS else \
+    is_aac = src.suffix.lower() in AAC_EXTS
+    codec = ["-c:a", "copy"] if is_aac else \
             ["-c:a", _ENCODER, "-b:a", target_bitrate(src)]
     _heavy(["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-i", str(src), "-map", "0:a", "-vn", *codec, "-f", "mp4", str(dst)])
+            "-i", str(src), "-map", "0:a", "-vn", *codec, "-f", "mp4", str(dst)],
+           None if is_aac else duration_s(src),      # copies are instant, no bar
+           None if is_aac else src.name)
     return dst, duration_s(dst)
 
 
@@ -266,7 +310,9 @@ def build(book, out_path, work, dry):
     if title:
         cmd += ["-metadata", f"title={title}", "-metadata", f"album={title}"]
     cmd += ["-f", "mp4", str(out_path)]
-    _heavy(cmd)
+    # live percent only for a real single-file encode; concat-copy is instant
+    enc = (not multi) and audio_codec[1] == _ENCODER
+    _heavy(cmd, duration_s(book[0]) if enc else None, title if enc else None)
 
     if multi:                                  # drop temp parts, keep the .m4b
         for t in temps:
@@ -358,6 +404,8 @@ def selftest():
     # bitrate: cap high sources at 128k, keep lower sources as-is
     assert _cap_kbps(320000) == "128k" and _cap_kbps(96000) == "96k" \
         and _cap_kbps(64000) == "64k"
+    # progress clock parsing: real timestamp -> seconds, "N/A" -> None
+    assert abs(_hms("01:02:03.5") - 3723.5) < 1e-6 and _hms("N/A") is None
     print("selftest ok")
 
 
