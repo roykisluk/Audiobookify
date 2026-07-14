@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """Turn a folder of audiobooks into iPhone-ready .m4b files.
 
-Run it inside an audiobook's folder (or pass DIR):
+Run it inside an audiobook's folder (or pass DIR, or a single audio FILE):
   - loose audio files in DIR -> merged into ONE .m4b named after the folder,
     one chapter per file (the common case: a book split into numbered parts)
   - each SUBFOLDER of audio files -> its own merged .m4b
 Covers are pulled from free APIs (iTunes -> Google Books -> Open Library, no
-key) unless the file already has embedded art. Books are processed in parallel.
-Output goes to ./m4b/ ; originals are never touched.
+key) unless the file already has embedded art -- or you drop a cover.jpg/.png
+(or <bookname>.jpg/.png) in the folder, which wins. Books run in parallel.
+Output lands next to the input; originals are never touched (a name clash gets
+a " (m4b)" suffix rather than overwriting).
 
-Usage:  python3 audiobookify.py [DIR] [--jobs N] [--dry-run] [--force]
+Usage:  python3 audiobookify.py [DIR|FILE] [--jobs N] [--dry-run] [--force]
         python3 audiobookify.py --selftest
 """
-import json, os, re, subprocess, sys, threading, urllib.parse, urllib.request
+import json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav"}
 AAC_EXTS = {".m4a", ".m4b", ".aac"}            # already AAC -> copy, never re-encode
 CAP_BITRATE = 128_000    # ponytail: transparent for speech; never encode above the source
-OUT_DIR = "m4b"
 UA = {"User-Agent": "audiobookify (https://github.com/)"}
 
 # Set by main(): how many ffmpeg encodes may run at once, and which encoder.
@@ -122,6 +123,19 @@ def has_cover(path):
     out = run(["ffprobe", "-v", "error", "-select_streams", "v",
                "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)]).stdout
     return "video" in out
+
+
+def local_cover(book):
+    """A cover.<ext> or <bookname>.<ext> (jpg/png) next to the audio overrides
+    web lookup and embedded art — drop one in the folder when auto-pick is wrong."""
+    folder = book[0].parent
+    stem = folder.name if len(book) > 1 else book[0].stem
+    for name in (stem, "cover"):
+        for ext in (".jpg", ".jpeg", ".png"):
+            p = folder / f"{name}{ext}"
+            if p.exists():
+                return p
+    return None
 
 
 def clean_title(name):
@@ -257,14 +271,16 @@ def build(book, out_path, work, dry):
                "copy" if book[0].suffix.lower() in AAC_EXTS else f"encode ({_ENCODER})")
         return f"would {how} -> {out_path.name}"
 
-    cover = work / "cover.jpg"
+    cover = local_cover(book)                  # a jpg/png in the folder wins
     src_has_cover = False
-    if multi:
-        fetch_cover(title, cover)
-    else:
-        src_has_cover = has_cover(book[0])
-        if not src_has_cover:
+    if cover is None:
+        cover = work / "cover.jpg"
+        if multi:
             fetch_cover(title, cover)
+        else:
+            src_has_cover = has_cover(book[0])
+            if not src_has_cover:
+                fetch_cover(title, cover)
     cover_ok = cover.exists()
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
@@ -324,6 +340,8 @@ def process_book(name, files, out_root, work_root, dry, force):
     """Returns a one-line status string (printed by the caller)."""
     safe = re.sub(r'[/:]', '-', name)
     out_path = out_root / (safe + ".m4b")
+    if any(out_path.resolve() == f.resolve() for f in files):   # would clobber source
+        out_path = out_root / (safe + " (m4b).m4b")
     n = len(files)
     label = f"{name}  ({n} file{'s' if n > 1 else ''})"
     if out_path.exists() and not force:
@@ -358,37 +376,43 @@ def main():
     _SEM = threading.BoundedSemaphore(jobs)
     _ENCODER = pick_encoder()
 
-    out_root = root / OUT_DIR
-    out_root.mkdir(exist_ok=True)
-    work_root = out_root / ".work"
-    work_root.mkdir(exist_ok=True)
+    single = root.is_file()               # one file arg -> just that book
+    out_root = root.parent if single else root   # output sits next to the input
+    work_root = Path(tempfile.mkdtemp(prefix="audiobookify-"))  # scratch, off-tree
 
     books = []  # (name, [files])
-    loose = []  # loose audio files in DIR = parts of one book (this folder)
-    for item in sorted(root.iterdir()):
-        if item.resolve() == out_root.resolve():
-            continue
-        if item.is_dir():
-            files = audio_files(item)
-            if files:
-                books.append((item.name, files))
-        elif item.is_file() and item.suffix.lower() in AUDIO_EXTS:
-            loose.append(item)
-    if loose:
-        books.append((root.name, sorted(loose)))
+    if single:
+        books.append((root.stem, [root]))
+    else:
+        for item in sorted(root.iterdir()):
+            if item.is_dir():
+                files = audio_files(item)
+                if files:
+                    books.append((item.name, files))
+        # a prior run's outputs live here now (no m4b/ subfolder) -> don't re-eat them
+        generated = {f"{re.sub(r'[/:]', '-', n)}.m4b" for n, _ in books}
+        generated.add(f"{re.sub(r'[/:]', '-', root.name)}.m4b")
+        loose = [item for item in sorted(root.iterdir())
+                 if item.is_file() and item.suffix.lower() in AUDIO_EXTS
+                 and item.name not in generated]
+        if loose:
+            books.append((root.name, sorted(loose)))
 
-    if not books:
-        print(f"No audiobooks found in {root}")
-        return
+    try:
+        if not books:
+            print(f"No audiobooks found in {root}")
+            return
 
-    workers = 1 if dry else min(jobs, len(books))
-    print(f"Audiobookify: {len(books)} book(s), {jobs} core(s), encoder={_ENCODER}\n")
+        workers = 1 if dry else min(jobs, len(books))
+        print(f"Audiobookify: {len(books)} book(s), {jobs} core(s), encoder={_ENCODER}\n")
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(process_book, name, files, out_root, work_root,
-                          dry, force): name for name, files in books}
-        for fut in as_completed(futs):
-            print(fut.result(), flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(process_book, name, files, out_root, work_root,
+                              dry, force): name for name, files in books}
+            for fut in as_completed(futs):
+                print(fut.result(), flush=True)
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
 
 
 def selftest():
@@ -406,6 +430,19 @@ def selftest():
         and _cap_kbps(64000) == "64k"
     # progress clock parsing: real timestamp -> seconds, "N/A" -> None
     assert abs(_hms("01:02:03.5") - 3723.5) < 1e-6 and _hms("N/A") is None
+    # local cover override: named/cover, jpg/png, single/multi; none -> None
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "Book.mp3").touch()
+        assert local_cover([d / "Book.mp3"]) is None
+        (d / "cover.png").touch()
+        assert local_cover([d / "Book.mp3"]) == d / "cover.png"
+        (d / "Book.jpg").touch()                  # same-name beats generic cover
+        assert local_cover([d / "Book.mp3"]) == d / "Book.jpg"
+        sub = d / "My Series"; sub.mkdir()
+        (sub / "01.mp3").touch(); (sub / "My Series.png").touch()
+        assert local_cover([sub / "01.mp3", sub / "02.mp3"]) == sub / "My Series.png"
     print("selftest ok")
 
 
