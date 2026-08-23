@@ -15,6 +15,25 @@ For each top-level item in the folder:
 - **Robust cover art** — tries iTunes, then Google Books, then Open Library,
   across a few title variants. Skipped if the file already has embedded art.
 - **No API keys, no accounts.** Just `ffmpeg`.
+- **Fixes HE-AAC that iPhones reject** — see below.
+
+## "Cannot be played on this iPhone"
+
+Some stores (Libro.fm among them) ship `.m4b` files whose HE-AAC audio is
+signalled *hierarchically* — AudioObjectType 5, advertised as `mp4a.40.5`.
+The audio frames are ordinary SBR and every iPhone can decode them, but
+Apple's sync check rejects the signalling itself:
+
+> “<book>” was not copied to the iPhone because it cannot be played on this iPhone.
+
+Since already-AAC audio is copied rather than re-encoded, the output would
+inherit the problem. So every finished `.m4b` gets its config re-signalled the
+backward-compatible way instead — AOT 2 plus the `0x2B7` SBR sync extension,
+advertised as `mp4a.40.2`, which Apple accepts.
+
+This rewrites **one field in the header**. Not a single audio byte changes, so
+it is lossless: decoded PCM is bit-identical, and chapters and cover art are
+untouched. Files that aren't hierarchical HE-AAC are left exactly as they are.
 
 ## Requirements
 

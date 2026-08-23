@@ -257,6 +257,140 @@ def _prep_part(src, work, idx):
     return dst, duration_s(dst)
 
 
+
+# ---- HE-AAC re-signalling -------------------------------------------------
+# Some stores (Libro.fm) ship .m4b files whose HE-AAC is signalled
+# hierarchically (AudioObjectType 5, advertised as mp4a.40.5). The frames are
+# ordinary SBR, but Apple's sync check rejects that signalling outright --
+# "<book> was not copied ... because it cannot be played on this iPhone".
+# We copy such audio verbatim, so the output inherits the problem. Re-signal
+# the identical stream the backward-compatible way (AOT 2 + the 0x2B7 SBR sync
+# extension, mp4a.40.2) instead of re-encoding it.
+
+_MP4_CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+_MP4_SKIP = {b"stsd": 8, b"mp4a": 28}          # box-specific bytes before children
+
+
+def _asc_backward_compatible(asc):
+    """AudioSpecificConfig -> the backward-compatible SBR form of the same
+    stream, or None if it is not hierarchically-signalled HE-AAC."""
+    bits = "".join(f"{b:08b}" for b in asc)
+    i = 0
+
+    def take(n):
+        nonlocal i
+        i += n
+        return int(bits[i - n:i], 2)
+
+    if len(bits) < 22 or take(5) != 5:         # not AOT 5
+        return None
+    freq, chans, ext_freq = take(4), take(4), take(4)
+    if take(5) != 2 or 15 in (freq, ext_freq):  # core must be plain AAC-LC
+        return None
+    out = f"{2:05b}{freq:04b}{chans:04b}000{0x2B7:011b}{5:05b}1{ext_freq:04b}"
+    out += "0" * (-len(out) % 8)
+    return bytes(int(out[j:j + 8], 2) for j in range(0, len(out), 8))
+
+
+def _find_esds(buf, start, end, chain):
+    """-> (offset of the esds payload, size-field offsets of every ancestor)."""
+    off = start
+    while off + 8 <= end:
+        size = int.from_bytes(buf[off:off + 4], "big")
+        typ, body = bytes(buf[off + 4:off + 8]), off + 8
+        if size == 1:
+            size, body = int.from_bytes(buf[off + 8:off + 16], "big"), off + 16
+        if size < 8:
+            return None
+        if typ == b"esds":
+            return body + 4, chain + [off]     # +4 skips version/flags
+        if typ in _MP4_CONTAINERS or typ in _MP4_SKIP:
+            hit = _find_esds(buf, body + _MP4_SKIP.get(typ, 0), off + size,
+                             chain + [off])
+            if hit:
+                return hit
+        off += size
+    return None
+
+
+def _desc_len(buf, off):
+    """MPEG-4 expandable length -> (value, offset of its last byte, next offset)."""
+    val = 0
+    while True:
+        b = buf[off]
+        off += 1
+        val = (val << 7) | (b & 0x7F)
+        if not b & 0x80:
+            return val, off - 1, off
+
+
+def fix_sbr_signalling(path):
+    """Rewrite path's HE-AAC config in place so Apple will sync it. Audio bytes
+    are untouched -- only the esds config grows by one byte. Returns True if it
+    changed anything; a no-op (and safe) on every other kind of file."""
+    total = path.stat().st_size
+    with path.open("rb") as f:
+        off, moov = 0, None
+        while off + 8 <= total:                # find the top-level moov
+            f.seek(off)
+            size, typ = int.from_bytes(f.read(4), "big"), f.read(4)
+            if size == 1:
+                size = int.from_bytes(f.read(8), "big")
+            if size < 8:
+                return False
+            if typ == b"moov":
+                moov = (off, size)
+            off += size
+        if not moov or moov[0] + moov[1] != total:
+            return False        # moov isn't last: growing it would shift mdat
+        f.seek(moov[0])
+        buf = bytearray(f.read(moov[1]))
+
+    hit = _find_esds(buf, 8, len(buf), [])
+    if not hit:
+        return False
+    desc, chain = hit
+
+    lens = []                                  # length fields that must grow too
+    if buf[desc] != 0x03:                      # ES_Descriptor
+        return False
+    _, lf, p = _desc_len(buf, desc + 1); lens.append(lf)
+    flags, p = buf[p + 2], p + 3
+    if flags & 0x80: p += 2                    # streamDependenceFlag
+    if flags & 0x40: p += 1 + buf[p]           # URL_Flag
+    if flags & 0x20: p += 2                    # OCRstreamFlag
+    if buf[p] != 0x04:                         # DecoderConfigDescriptor
+        return False
+    _, lf, p = _desc_len(buf, p + 1); lens.append(lf)
+    p += 13                                    # objectType..avgBitrate
+    if buf[p] != 0x05:                         # DecoderSpecificInfo
+        return False
+    n, lf, asc = _desc_len(buf, p + 1); lens.append(lf)
+
+    new = _asc_backward_compatible(bytes(buf[asc:asc + n]))
+    if new is None:
+        return False
+    grow = len(new) - n
+    if any(buf[o] + grow > 0x7F for o in lens):
+        return False                           # would need a wider length field
+
+    out = buf[:asc] + new + buf[asc + n:]
+    for o in lens:
+        out[o] += grow
+    for o in [0] + chain:                      # moov itself, then every ancestor
+        out[o:o + 4] = (int.from_bytes(out[o:o + 4], "big") + grow).to_bytes(4, "big")
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with path.open("rb") as f, tmp.open("wb") as g:
+        left = moov[0]
+        while left:
+            chunk = f.read(min(1 << 20, left))
+            g.write(chunk); left -= len(chunk)
+        g.write(out)
+    tmp.replace(path)
+    return True
+
+
 def build(book, out_path, work, dry):
     """book = list of audio file Paths (1 = single, >1 = merge).
     Multi-part books encode every part in parallel, then concat-copy — uses all
@@ -329,6 +463,7 @@ def build(book, out_path, work, dry):
     # live percent only for a real single-file encode; concat-copy is instant
     enc = (not multi) and audio_codec[1] == _ENCODER
     _heavy(cmd, duration_s(book[0]) if enc else None, title if enc else None)
+    fix_sbr_signalling(out_path)               # Apple won't sync mp4a.40.5
 
     if multi:                                  # drop temp parts, keep the .m4b
         for t in temps:
@@ -428,6 +563,9 @@ def selftest():
     # bitrate: cap high sources at 128k, keep lower sources as-is
     assert _cap_kbps(320000) == "128k" and _cap_kbps(96000) == "96k" \
         and _cap_kbps(64000) == "64k"
+    # HE-AAC signalled hierarchically (mp4a.40.5) -> backward compatible
+    assert _asc_backward_compatible(bytes.fromhex("2b8a0800")).hex() == "138856e5a0"
+    assert _asc_backward_compatible(bytes.fromhex("138856e5a0")) is None   # plain LC
     # progress clock parsing: real timestamp -> seconds, "N/A" -> None
     assert abs(_hms("01:02:03.5") - 3723.5) < 1e-6 and _hms("N/A") is None
     # local cover override: named/cover, jpg/png, single/multi; none -> None
