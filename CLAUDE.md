@@ -66,3 +66,41 @@ fix supersedes it.
 diagnosis rests on the working/broken pair in the library. If a file with
 `mp4a.40.2` still gets refused, the next suspects are the `M4A ` major brand
 and the chapter text track.
+
+### 2026-08-24 — `.cue` sidecars: chapters for one-big-file books
+
+**Symptom.** A 12-hour single-`.mp3` book came out with zero chapters, while a
+`.cue` listing 20 of them sat unused in the same folder.
+
+**Fix.** `cue_chapters()` turns a sidecar `<book>.cue` into ffmetadata for the
+single-file path. Guarded by `has_chapters()` — a source that already carries
+its own chapters (a store `.m4b`) keeps them; the cue never overrides.
+
+**Root cause of the follow-up failure.** First version divided the third INDEX
+field by 75 (CUE frames). This library's cues write **centiseconds**: values up
+to 91 appear, which is impossible for frames (0–74). Dividing by 75 inflated
+every mark, and the last one landed *past EOF* — ffmpeg then refused the whole
+metadata input with a misleading error:
+
+    Chapter end time 44214430 before start 44214573
+    Error opening input: Cannot allocate memory
+
+"Cannot allocate memory" is what ffmpeg reports for a rejected metadata input;
+it has nothing to do with memory. The real message is the line above it.
+`per_s` is now sniffed per file (any field > 74 → centiseconds), and marks at
+or past the source duration are dropped.
+
+**Gotchas.**
+
+- `-map_metadata 1` on the cue path replaces the source's global tags, so the
+  mp3's artist/date are dropped (title/album are re-set explicitly). Same
+  behaviour the multi-file path already had.
+- `selftest()` had a stray `import tempfile` at the bottom of the function.
+  That makes `tempfile` local to the *whole* function, so a use above it raised
+  `UnboundLocalError` despite the module-level import. Removed.
+- The cue's header `TITLE "<album>"` precedes the first `TRACK`; reset the
+  pending title on every `TRACK` line or chapter 1 inherits the book title.
+
+**Not derivable.** `DumbingUsDownUnabridged.mp3` and `Free-Range Kids` have no
+cue and no embedded chapters — nothing to build a chapter list from, so they
+ship as one chapter.

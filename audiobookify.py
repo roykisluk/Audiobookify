@@ -238,6 +238,43 @@ def chapter_metadata(files, durations):
     return "\n".join(lines) + "\n"
 
 
+def has_chapters(path):
+    out = run(["ffprobe", "-v", "error", "-show_chapters",
+               "-of", "csv=p=0", str(path)]).stdout
+    return bool(out.strip())
+
+
+def cue_chapters(cue, total_s):
+    """ffmetadata from a .cue sidecar next to a single-file book. INDEX times
+    are MIN:SEC:SUB with minutes free to exceed 59. SUB is nominally 1/75 s
+    frames, but plenty of audiobook cues write centiseconds — a value above 74
+    settles it, and guessing wrong pushes the last mark past EOF, which ffmpeg
+    rejects outright. Returns None if the cue carries no usable track index."""
+    raw, title = [], None
+    for line in cue.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("TRACK "):
+            title = None                       # drop the cue's album TITLE
+        elif line.startswith("TITLE "):
+            title = line[6:].strip().strip('"')
+        elif line.startswith("INDEX 01"):
+            mm, ss, sub = (int(x) for x in line.split()[2].split(":"))
+            raw.append((mm, ss, sub, title))
+    per_s = 100 if any(sub > 74 for _, _, sub, _ in raw) else 75
+    marks = [(mm * 60 + ss + sub / per_s, t) for mm, ss, sub, t in raw
+             if mm * 60 + ss < total_s]
+    if not marks:
+        return None
+    lines = [";FFMETADATA1"]
+    for i, (start, name) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else total_s
+        if end <= start:                       # ragged tail mark -> drop it
+            continue
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(start * 1000)}",
+                  f"END={int(end * 1000)}", f"title={name or f'Chapter {i + 1}'}"]
+    return "\n".join(lines) + "\n"
+
+
 def audio_files(folder):
     return sorted(p for p in folder.iterdir()
                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
@@ -436,6 +473,14 @@ def build(book, out_path, work, dry):
     else:
         cmd += ["-i", str(book[0])]
         n_in, meta_idx = 1, None
+        cue = book[0].with_suffix(".cue")       # sidecar chapters for one big file
+        if cue.exists() and not has_chapters(book[0]):
+            meta = cue_chapters(cue, duration_s(book[0]))
+            if meta:
+                metafile = work / "meta.txt"
+                metafile.write_text(meta)
+                cmd += ["-i", str(metafile)]
+                n_in, meta_idx = 2, 1
         s = book[0].suffix.lower()
         audio_codec = ["-c:a", "copy"] if s in AAC_EXTS else \
                       ["-c:a", _ENCODER, "-b:a", target_bitrate(book[0])]
@@ -568,6 +613,18 @@ def selftest():
     # identical part names -> numbered chapters, not 10x the same title
     d = chapter_metadata([Path("01 The Book.mp3"), Path("02 The Book.mp3")], [1, 1])
     assert "title=Chapter 1" in d and "title=Chapter 2" in d
+    cue = Path(tempfile.mkdtemp()) / "x.cue"
+    cue.write_text('TITLE "Album"\nTRACK 1 AUDIO\n  TITLE "One"\n  INDEX 01 0:0:00\n'
+                   'TRACK 2 AUDIO\n  TITLE "Two"\n  INDEX 01 1:30:38\n')
+    c = cue_chapters(cue, 200.0)
+    assert "title=One" in c and "title=Two" in c and "title=Album" not in c
+    assert "START=0" in c and "END=90506" in c and "START=90506" in c and "END=200000" in c
+    # a sub-second field above 74 means centiseconds, not 1/75 frames
+    cue.write_text('TRACK 1 AUDIO\n  INDEX 01 0:0:00\nTRACK 2 AUDIO\n  INDEX 01 1:30:91\n')
+    assert "START=90910" in cue_chapters(cue, 200.0)
+    # a mark at/past EOF would make end <= start; ffmpeg refuses that, so drop it
+    cue.write_text('TRACK 1 AUDIO\n  INDEX 01 0:0:00\nTRACK 2 AUDIO\n  INDEX 01 5:0:00\n')
+    assert cue_chapters(cue, 200.0).count("[CHAPTER]") == 1
     # bitrate: cap high sources at 128k, keep lower sources as-is
     assert _cap_kbps(320000) == "128k" and _cap_kbps(96000) == "96k" \
         and _cap_kbps(64000) == "64k"
@@ -577,7 +634,6 @@ def selftest():
     # progress clock parsing: real timestamp -> seconds, "N/A" -> None
     assert abs(_hms("01:02:03.5") - 3723.5) < 1e-6 and _hms("N/A") is None
     # local cover override: named/cover, jpg/png, single/multi; none -> None
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "Book.mp3").touch()
