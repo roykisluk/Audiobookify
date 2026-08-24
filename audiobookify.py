@@ -503,6 +503,11 @@ def main():
         i = args.index("--jobs")
         jobs = max(1, int(args[i + 1]))
         del args[i:i + 2]
+    out_arg = None
+    if "--out" in args:
+        i = args.index("--out")
+        out_arg = args[i + 1]
+        del args[i:i + 2]
     pos = [a for a in args if not a.startswith("-")]
     root = Path(pos[0]) if pos else Path.cwd()
 
@@ -513,6 +518,9 @@ def main():
 
     single = root.is_file()               # one file arg -> just that book
     out_root = root.parent if single else root   # output sits next to the input
+    if out_arg:
+        out_root = Path(out_arg)
+        out_root.mkdir(parents=True, exist_ok=True)
     work_root = Path(tempfile.mkdtemp(prefix="audiobookify-"))  # scratch, off-tree
 
     books = []  # (name, [files])

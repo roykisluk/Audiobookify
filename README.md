@@ -49,6 +49,7 @@ audiobookify ~/Books      # process a specific folder
 audiobookify --dry-run    # print the ffmpeg commands, change nothing
 audiobookify --force      # rebuild even if the .m4b already exists
 audiobookify --jobs 2     # cap parallelism (default: one per CPU)
+audiobookify --out ~/AB   # write the .m4b files elsewhere
 ```
 
 Output `.m4b` files go to `./m4b/` inside the target folder.
