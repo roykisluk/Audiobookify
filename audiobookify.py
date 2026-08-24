@@ -145,6 +145,62 @@ def clean_title(name):
     return re.sub(r"\s+", " ", name).strip(" -")
 
 
+EDITION_RE = re.compile(
+    r"\b((?:\d+(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|revised|"
+    r"expanded|updated|anniversary)[\w\s]*?edition)\b", re.I)
+ABRIDGE_RE = re.compile(r"\b(unabridged|abridged)\b", re.I)
+
+
+def tags_of(path):
+    out = run(["ffprobe", "-v", "error", "-show_entries", "format_tags",
+               "-of", "json", str(path)]).stdout
+    try:
+        t = json.loads(out).get("format", {}).get("tags", {})
+    except json.JSONDecodeError:
+        return {}
+    return {k.lower(): v for k, v in t.items()}
+
+
+def std_name(raw, blob, author):
+    """The pure half of standard_name(). Returns (filename, title): the
+    filename is '<Title> - <Author> (<Edition>, <Unabridged>)', the title is
+    the bare book title — they stay separate because the tags get the title
+    and the author in their own fields, not the display name.
+    `raw` is the best title string, `blob` everything we know about the book
+    (names + tags) — edition and abridgement are hunted there because they
+    often sit in the folder name and nowhere else."""
+    if " " not in raw:                          # "DumbingUsDownUnabridged"
+        raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
+    blob = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", blob)   # so \b can see the words
+    ed = EDITION_RE.search(blob)
+    ab = ABRIDGE_RE.search(blob)
+    title = EDITION_RE.sub("", raw)
+    title = re.sub(r"\([^)]*\)", " ", title)     # (Unabridged), (Pack #03)
+    title = ABRIDGE_RE.sub(" ", title)
+    title = re.split(r":|\s+-\s+", title)[0]     # drop the subtitle
+    title = re.sub(r"\s+", " ", title).strip(" -,")
+    extra = [" ".join(w.capitalize() if w.isalpha() and w.islower() else w
+                      for w in x.split())
+             for x in (ed.group(1) if ed else "", ab.group(1) if ab else "") if x]
+    name = f"{title} - {author}" if author else title
+    return name + (f" ({', '.join(extra)})" if extra else ""), title
+
+
+def standard_name(book):
+    """(filename, title, author) from the source's own tags, with the author
+    looked up online when the file carries none."""
+    tags = tags_of(book[0])
+    src = book[0].parent.name if len(book) > 1 else book[0].stem
+    raw = tags.get("album") or src
+    blob = " ".join((src, raw, tags.get("title", "")))
+    author = tags.get("artist") or tags.get("album_artist") or ""
+    author = author.split("/")[0]               # narrator appended after a slash
+    author = re.sub(r",?\s*\b(ph\.?d|m\.?d|m\.?a)\.?\b", "", author, flags=re.I).strip()
+    if not author:
+        author = itunes_author(std_name(raw, blob, "")[1]) or ""
+    return std_name(raw, blob, author) + (author,)
+
+
 def _get_json(url):
     try:
         req = urllib.request.Request(url, headers=UA)
@@ -162,6 +218,14 @@ def _itunes(term):
             url = res.get("artworkUrl100", "")
             if url:
                 yield re.sub(r"/\d+x\d+bb\.(jpg|png)", r"/600x600bb.\1", url)
+
+
+def itunes_author(title):
+    """Author name for a title with no artist tag. Same API the covers use."""
+    q = urllib.parse.urlencode({"term": title, "media": "audiobook", "limit": 1})
+    for res in (_get_json(f"https://itunes.apple.com/search?{q}") or {}).get("results", []):
+        return res.get("artistName")
+    return None
 
 
 def _google_books(term):
@@ -428,12 +492,12 @@ def fix_sbr_signalling(path):
     return True
 
 
-def build(book, out_path, work, dry):
+def build(book, out_path, work, dry, title=None, author=None):
     """book = list of audio file Paths (1 = single, >1 = merge).
     Multi-part books encode every part in parallel, then concat-copy — uses all
     cores instead of one serial encode through the concat demuxer."""
     multi = len(book) > 1
-    title = clean_title(book[0].parent.name if multi else book[0].name)
+    title = title or clean_title(book[0].parent.name if multi else book[0].name)
 
     if dry:
         how = (f"encode {len(book)} parts in parallel ({_ENCODER}, source rate "
@@ -446,12 +510,13 @@ def build(book, out_path, work, dry):
     src_has_cover = False
     if cover is None:
         cover = work / "cover.jpg"
+        query = f"{title} - {author}" if author else title
         if multi:
-            fetch_cover(title, cover)
+            fetch_cover(query, cover)
         else:
             src_has_cover = has_cover(book[0])
             if not src_has_cover:
-                fetch_cover(title, cover)
+                fetch_cover(query, cover)
     cover_ok = cover.exists()
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
@@ -504,6 +569,11 @@ def build(book, out_path, work, dry):
         cmd += ["-disposition:v", "attached_pic"]
     if title:
         cmd += ["-metadata", f"title={title}", "-metadata", f"album={title}"]
+    if author:                                 # a multi-part book maps metadata
+        cmd += ["-metadata", f"artist={author}",       # from the chapter file,
+                "-metadata", f"album_artist={author}"]  # which carries no artist
+
+
     cmd += ["-f", "mp4", str(out_path)]
     # live percent only for a real single-file encode; concat-copy is instant
     enc = (not multi) and audio_codec[1] == _ENCODER
@@ -518,6 +588,7 @@ def build(book, out_path, work, dry):
 
 def process_book(name, files, out_root, work_root, dry, force):
     """Returns a one-line status string (printed by the caller)."""
+    name, title, author = standard_name(files)
     safe = re.sub(r'[/:]', '-', name)
     out_path = out_root / (safe + ".m4b")
     if any(out_path.resolve() == f.resolve() for f in files):   # would clobber source
@@ -529,7 +600,7 @@ def process_book(name, files, out_root, work_root, dry, force):
     work = work_root / safe
     work.mkdir(exist_ok=True)
     try:
-        msg = build(files, out_path, work, dry)
+        msg = build(files, out_path, work, dry, title, author)
         if dry:
             return f"→ {label}\n   {msg}"
         return f"✓ done: {label} -> {out_path.name}"
@@ -625,6 +696,16 @@ def selftest():
     # a mark at/past EOF would make end <= start; ffmpeg refuses that, so drop it
     cue.write_text('TRACK 1 AUDIO\n  INDEX 01 0:0:00\nTRACK 2 AUDIO\n  INDEX 01 5:0:00\n')
     assert cue_chapters(cue, 200.0).count("[CHAPTER]") == 1
+    assert std_name("How Children Learn, 50th Anniversary Edition",
+                    "How Children Learn, 50th Anniversary Edition (Unabridged)", "John Holt") == \
+        ("How Children Learn - John Holt (50th Anniversary Edition, Unabridged)",
+         "How Children Learn")
+    assert std_name("Grow Wild: The Whole-Child Guide (Pack #03)", "", "Katy Bowman") == \
+        ("Grow Wild - Katy Bowman", "Grow Wild")
+    assert std_name("DumbingUsDownUnabridged", "DumbingUsDownUnabridged",
+                    "John Taylor Gatto")[0] == "Dumbing Us Down - John Taylor Gatto (Unabridged)"
+    assert std_name("Better with Age - The Psychology of Aging", "", "") == \
+        ("Better with Age", "Better with Age")
     # bitrate: cap high sources at 128k, keep lower sources as-is
     assert _cap_kbps(320000) == "128k" and _cap_kbps(96000) == "96k" \
         and _cap_kbps(64000) == "64k"

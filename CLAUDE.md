@@ -104,3 +104,40 @@ or past the source duration are dropped.
 **Not derivable.** `DumbingUsDownUnabridged.mp3` and `Free-Range Kids` have no
 cue and no embedded chapters — nothing to build a chapter list from, so they
 ship as one chapter.
+
+### 2026-08-24 — standardized output names: `Title - Author (Edition, Unabridged)`
+
+Output filenames now come from `standard_name()` rather than the input's folder
+or file name, which arrive in every shape (`Author - Title`, `Title by Author
+(Audiobook)`, `DumbingUsDownUnabridged`).
+
+**Where the pieces come from.** The `album` tag is a far better title source
+than the `title` tag: `title` is often the *part* (`Free to Learn - Part 01`) or
+the *subtitle* (Unconditional Parenting's title tag is "Moving from Rewards and
+Punishments to Love and Reason"). Album was right for all 13 books in the test
+library. Author is `artist`/`album_artist`, cut at the first `/` (the narrator
+is appended there) and stripped of `, PhD`. When there is no artist tag at all,
+`itunes_author()` looks it up — the same API the covers already use — which is
+what supplies Gatto and Skenazy.
+
+**Edition and abridgement are searched in a blob of every string we have**
+(folder name + file name + tags), not just the title: `(Unabridged)` frequently
+lives only in the folder name.
+
+**Gotcha — the display name must not reach the tags.** First version set
+`title = standard_name(...)`, so `-metadata title=` became "Hold On to Your
+Kids - Gordon Neufeld, Gabor Maté (Unabridged)" and Apple Books would show the
+author twice. `std_name()` therefore returns *both* the filename and the bare
+title, and `build()` takes title and author as separate arguments. Filename
+shape and tag shape are different things; keep them in different variables.
+
+**Gotchas that cost time:**
+
+- `.title()` on "50th Anniversary Edition" yields "50**T**h". Capitalize
+  word-by-word and only when the word `isalpha() and islower()`.
+- `\bunabridged\b` cannot match inside `DumbingUsDownUnabridged` — no word
+  boundary between `n` and `U`. The blob gets the camel-case split too, not
+  just the title.
+- Multi-part books use `-map_metadata 1` (the chapter file), which has no
+  global tags, so the author was being dropped entirely. `artist` and
+  `album_artist` are now set explicitly from the resolved author.
