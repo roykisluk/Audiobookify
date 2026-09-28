@@ -141,3 +141,26 @@ shape and tag shape are different things; keep them in different variables.
 - Multi-part books use `-map_metadata 1` (the chapter file), which has no
   global tags, so the author was being dropped entirely. `artist` and
   `album_artist` are now set explicitly from the resolved author.
+
+### 2026-09-28 — multi-disk book, wrong cover, `--out` inside the root
+
+**Symptom 1.** A book shipped as `Book/Disk 1 …/`, `Disk 2 …/` … would come
+out as six separate `.m4b`s. **Cause:** each subfolder of the target is its own
+book, and a folder is not searched recursively. **Workaround (no code change):**
+copy the tracks into one flat staging folder, renumbered `01 … 43` so the order
+holds across disks (the chapter title drops the leading number). The per-disk
+`album` tag (`… Disk 1 The Theory Of Gravitation`) would become the title, so
+retag the *copies* with `ffmpeg -c copy -metadata album=<series>`.
+
+**Symptom 2.** *The Very Best of the Feynman Lectures* got the cover of *The
+Pleasure of Finding Things Out*. **Cause:** iTunes has no audiobook by that
+name, so the fuzzy search returned a different book by the same author. Open
+Library had the right one (`cover_i` 299373). **Fix used:** drop `cover.jpg`
+in the book folder (the local override) and rebuild with `--force`. Open
+question: `fetch_cover()` does not check that the hit's title matches the
+query, so an author-only match is accepted. Always look at the cover.
+
+**Symptom 3.** The second run left an extra `<name> (m4b).m4b`. **Cause:** my
+`--out` pointed *inside* the target folder, so the run found `out/` as one
+more "book" (its only file was the first run's `.m4b`) and repackaged it.
+Keep `--out` outside the target folder.
